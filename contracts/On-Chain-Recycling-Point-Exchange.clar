@@ -1,0 +1,154 @@
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-found (err u101))
+(define-constant err-insufficient-balance (err u102))
+(define-constant err-invalid-amount (err u103))
+(define-constant err-already-exists (err u104))
+(define-constant err-not-enough-points (err u105))
+
+(define-fungible-token recycling-points)
+
+(define-map user-contributions principal uint)
+(define-map material-types uint {name: (string-ascii 50), points-per-unit: uint})
+(define-map contribution-records uint {contributor: principal, material-type: uint, quantity: uint, timestamp: uint})
+(define-map reward-catalog uint {name: (string-ascii 50), cost: uint, available: uint})
+(define-map user-redemptions principal (list 20 uint))
+
+(define-data-var next-contribution-id uint u1)
+(define-data-var next-material-type-id uint u1)
+(define-data-var next-reward-id uint u1)
+(define-data-var total-contributions uint u0)
+(define-data-var total-redemptions uint u0)
+
+(define-public (add-material-type (name (string-ascii 50)) (points-per-unit uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> points-per-unit u0) err-invalid-amount)
+    (let ((material-id (var-get next-material-type-id)))
+      (map-set material-types material-id {name: name, points-per-unit: points-per-unit})
+      (var-set next-material-type-id (+ material-id u1))
+      (ok material-id))))
+
+(define-public (add-reward (name (string-ascii 50)) (cost uint) (available uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> cost u0) err-invalid-amount)
+    (let ((reward-id (var-get next-reward-id)))
+      (map-set reward-catalog reward-id {name: name, cost: cost, available: available})
+      (var-set next-reward-id (+ reward-id u1))
+      (ok reward-id))))
+
+(define-public (contribute-material (material-type-id uint) (quantity uint))
+  (let ((material-info (unwrap! (map-get? material-types material-type-id) err-not-found))
+        (contribution-id (var-get next-contribution-id))
+        (points-earned (* quantity (get points-per-unit material-info)))
+        (current-contributions (default-to u0 (map-get? user-contributions tx-sender))))
+    (asserts! (> quantity u0) err-invalid-amount)
+    (try! (ft-mint? recycling-points points-earned tx-sender))
+    (map-set user-contributions tx-sender (+ current-contributions quantity))
+    (map-set contribution-records contribution-id 
+      {contributor: tx-sender, material-type: material-type-id, quantity: quantity, timestamp: stacks-block-height})
+    (var-set next-contribution-id (+ contribution-id u1))
+    (var-set total-contributions (+ (var-get total-contributions) quantity))
+    (ok {contribution-id: contribution-id, points-earned: points-earned})))
+
+(define-public (redeem-reward (reward-id uint))
+  (let ((reward-info (unwrap! (map-get? reward-catalog reward-id) err-not-found))
+        (user-balance (ft-get-balance recycling-points tx-sender))
+        (current-redemptions (default-to (list) (map-get? user-redemptions tx-sender))))
+    (asserts! (>= user-balance (get cost reward-info)) err-not-enough-points)
+    (asserts! (> (get available reward-info) u0) err-not-found)
+    (try! (ft-burn? recycling-points (get cost reward-info) tx-sender))
+    (map-set reward-catalog reward-id 
+      {name: (get name reward-info), cost: (get cost reward-info), available: (- (get available reward-info) u1)})
+    (map-set user-redemptions tx-sender (unwrap! (as-max-len? (append current-redemptions reward-id) u20) err-invalid-amount))
+    (var-set total-redemptions (+ (var-get total-redemptions) u1))
+    (ok reward-id)))
+
+(define-public (transfer-points (amount uint) (recipient principal))
+  (begin
+    (asserts! (> amount u0) err-invalid-amount)
+    (ft-transfer? recycling-points amount tx-sender recipient)))
+
+(define-read-only (get-user-balance (user principal))
+  (ft-get-balance recycling-points user))
+
+(define-read-only (get-user-contributions (user principal))
+  (default-to u0 (map-get? user-contributions user)))
+
+(define-read-only (get-material-type (material-id uint))
+  (map-get? material-types material-id))
+
+(define-read-only (get-reward-info (reward-id uint))
+  (map-get? reward-catalog reward-id))
+
+(define-read-only (get-contribution-record (contribution-id uint))
+  (map-get? contribution-records contribution-id))
+
+(define-read-only (get-user-redemptions (user principal))
+  (default-to (list) (map-get? user-redemptions user)))
+
+(define-read-only (get-total-contributions)
+  (var-get total-contributions))
+
+(define-read-only (get-total-redemptions)
+  (var-get total-redemptions))
+
+(define-read-only (get-contract-stats)
+  {total-contributions: (var-get total-contributions),
+   total-redemptions: (var-get total-redemptions),
+   next-contribution-id: (var-get next-contribution-id),
+   next-material-type-id: (var-get next-material-type-id),
+   next-reward-id: (var-get next-reward-id)})
+
+(define-public (update-reward-availability (reward-id uint) (new-availability uint))
+  (let ((reward-info (unwrap! (map-get? reward-catalog reward-id) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set reward-catalog reward-id 
+      {name: (get name reward-info), cost: (get cost reward-info), available: new-availability})
+    (ok true)))
+
+(define-public (batch-contribute (contributions (list 10 {material-type: uint, quantity: uint})))
+  (fold check-and-contribute contributions (ok u0)))
+
+(define-private (check-and-contribute (contribution {material-type: uint, quantity: uint}) (previous-response (response uint uint)))
+  (match previous-response
+    prev-val (match (contribute-material (get material-type contribution) (get quantity contribution))
+                success (ok (+ prev-val (get points-earned success)))
+                error (err error))
+    error (err error)))
+
+(define-read-only (get-leaderboard-position (user principal))
+  (let ((user-total (get-user-contributions user)))
+    (if (> user-total u0)
+      (ok user-total)
+      err-not-found)))
+
+(define-public (emergency-pause)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (ok true)))
+
+(define-read-only (get-token-name)
+  "Recycling Points")
+
+(define-read-only (get-token-symbol)
+  "RCP")
+
+(define-read-only (get-token-decimals)
+  u0)
+
+(define-read-only (get-total-supply)
+  (ft-get-supply recycling-points))
+
+(begin
+  (try! (add-material-type "Plastic Bottles" u10))
+  (try! (add-material-type "Glass Bottles" u15))
+  (try! (add-material-type "Aluminum Cans" u20))
+  (try! (add-material-type "Paper Waste" u5))
+  (try! (add-reward "Eco-Friendly Water Bottle" u100 u50))
+  (try! (add-reward "Reusable Shopping Bag" u150 u30))
+  (try! (add-reward "Solar Power Bank" u500 u10))
+  (try! (add-reward "Bamboo Cutlery Set" u75 u25))
+  (print "Contract initialized with default material types and rewards")
+  (ok true))
