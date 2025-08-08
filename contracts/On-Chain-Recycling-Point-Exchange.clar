@@ -152,3 +152,67 @@
   (try! (add-reward "Bamboo Cutlery Set" u75 u25))
   (print "Contract initialized with default material types and rewards")
   (ok true))
+
+(define-map active-multipliers uint {multiplier: uint, start-block: uint, end-block: uint, material-type: (optional uint)})
+(define-data-var next-multiplier-id uint u1)
+(define-constant err-multiplier-expired (err u106))
+(define-constant err-multiplier-not-active (err u107))
+
+(define-public (create-multiplier (multiplier uint) (duration-blocks uint) (material-type (optional uint)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> multiplier u100) err-invalid-amount)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    (let ((multiplier-id (var-get next-multiplier-id))
+          (start-block stacks-block-height)
+          (end-block (+ stacks-block-height duration-blocks)))
+      (map-set active-multipliers multiplier-id 
+        {multiplier: multiplier, start-block: start-block, end-block: end-block, material-type: material-type})
+      (var-set next-multiplier-id (+ multiplier-id u1))
+      (ok multiplier-id))))
+
+(define-private (get-active-multiplier (material-type-id uint))
+  (let ((current-block stacks-block-height))
+    (fold find-best-multiplier 
+      (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+      {best-multiplier: u100, material-match: false, current-block: current-block, target-material: material-type-id})))
+
+(define-private (find-best-multiplier (multiplier-id uint) (acc {best-multiplier: uint, material-match: bool, current-block: uint, target-material: uint}))
+  (match (map-get? active-multipliers multiplier-id)
+    multiplier-data 
+      (if (and (>= (get current-block acc) (get start-block multiplier-data))
+               (<= (get current-block acc) (get end-block multiplier-data)))
+        (match (get material-type multiplier-data)
+          some-material
+            (if (is-eq some-material (get target-material acc))
+              {best-multiplier: (get multiplier multiplier-data), material-match: true, 
+               current-block: (get current-block acc), target-material: (get target-material acc)}
+              acc)
+          (if (not (get material-match acc))
+            {best-multiplier: (if (> (get multiplier multiplier-data) (get best-multiplier acc)) (get multiplier multiplier-data) (get best-multiplier acc)), 
+             material-match: false, current-block: (get current-block acc), target-material: (get target-material acc)}
+            acc))
+        acc)
+    acc))
+
+(define-public (contribute-material-with-multiplier (material-type-id uint) (quantity uint))
+  (let ((material-info (unwrap! (map-get? material-types material-type-id) err-not-found))
+        (contribution-id (var-get next-contribution-id))
+        (base-points (* quantity (get points-per-unit material-info)))
+        (multiplier-result (get-active-multiplier material-type-id))
+        (final-points (/ (* base-points (get best-multiplier multiplier-result)) u100))
+        (current-contributions (default-to u0 (map-get? user-contributions tx-sender))))
+    (asserts! (> quantity u0) err-invalid-amount)
+    (try! (ft-mint? recycling-points final-points tx-sender))
+    (map-set user-contributions tx-sender (+ current-contributions quantity))
+    (map-set contribution-records contribution-id 
+      {contributor: tx-sender, material-type: material-type-id, quantity: quantity, timestamp: stacks-block-height})
+    (var-set next-contribution-id (+ contribution-id u1))
+    (var-set total-contributions (+ (var-get total-contributions) quantity))
+    (ok {contribution-id: contribution-id, points-earned: final-points, multiplier-applied: (get best-multiplier multiplier-result)})))
+
+(define-read-only (get-current-multiplier (material-type-id uint))
+  (get best-multiplier (get-active-multiplier material-type-id)))
+
+(define-read-only (get-multiplier-info (multiplier-id uint))
+  (map-get? active-multipliers multiplier-id))
