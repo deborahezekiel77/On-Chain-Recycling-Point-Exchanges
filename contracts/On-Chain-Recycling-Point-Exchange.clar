@@ -6,6 +6,13 @@
 (define-constant err-already-exists (err u104))
 (define-constant err-not-enough-points (err u105))
 
+(define-data-var next-challenge-id uint u1)
+(define-constant err-challenge-not-found (err u108))
+(define-constant err-challenge-expired (err u109))
+(define-constant err-challenge-completed (err u110))
+(define-constant err-bonus-already-claimed (err u111))
+(define-constant err-challenge-not-active (err u112))
+
 (define-fungible-token recycling-points)
 
 (define-map user-contributions principal uint)
@@ -216,3 +223,95 @@
 
 (define-read-only (get-multiplier-info (multiplier-id uint))
   (map-get? active-multipliers multiplier-id))
+
+  (define-map community-challenges uint {
+  title: (string-ascii 50),
+  target-quantity: uint,
+  current-progress: uint,
+  bonus-percentage: uint,
+  deadline-block: uint,
+  is-completed: bool,
+  participant-count: uint
+})
+
+(define-map challenge-participants {challenge-id: uint, user: principal} {
+  contribution-amount: uint,
+  has-claimed-bonus: bool
+})
+
+
+(define-public (create-community-challenge 
+  (title (string-ascii 50))
+  (target-quantity uint)
+  (bonus-percentage uint)
+  (duration-blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> target-quantity u0) err-invalid-amount)
+    (asserts! (> bonus-percentage u0) err-invalid-amount)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    (let ((challenge-id (var-get next-challenge-id))
+          (deadline (+ stacks-block-height duration-blocks)))
+      (map-set community-challenges challenge-id {
+        title: title,
+        target-quantity: target-quantity,
+        current-progress: u0,
+        bonus-percentage: bonus-percentage,
+        deadline-block: deadline,
+        is-completed: false,
+        participant-count: u0
+      })
+      (var-set next-challenge-id (+ challenge-id u1))
+      (ok challenge-id))))
+
+(define-public (participate-in-challenge (challenge-id uint) (contribution-quantity uint))
+  (let ((challenge (unwrap! (map-get? community-challenges challenge-id) err-challenge-not-found))
+        (participant-key {challenge-id: challenge-id, user: tx-sender})
+        (existing-participation (map-get? challenge-participants participant-key)))
+    (asserts! (<= stacks-block-height (get deadline-block challenge)) err-challenge-expired)
+    (asserts! (not (get is-completed challenge)) err-challenge-completed)
+    (asserts! (> contribution-quantity u0) err-invalid-amount)
+    
+    (let ((new-progress (+ (get current-progress challenge) contribution-quantity))
+          (existing-amount (match existing-participation
+                             some-participation (get contribution-amount some-participation)
+                             u0))
+          (is-new-participant (is-none existing-participation)))
+      
+      (map-set challenge-participants participant-key {
+        contribution-amount: (+ existing-amount contribution-quantity),
+        has-claimed-bonus: false
+      })
+      
+      (map-set community-challenges challenge-id {
+        title: (get title challenge),
+        target-quantity: (get target-quantity challenge),
+        current-progress: new-progress,
+        bonus-percentage: (get bonus-percentage challenge),
+        deadline-block: (get deadline-block challenge),
+        is-completed: (>= new-progress (get target-quantity challenge)),
+        participant-count: (if is-new-participant (+ (get participant-count challenge) u1) (get participant-count challenge))
+      })
+      (ok new-progress))))
+
+
+(define-public (claim-challenge-bonus (challenge-id uint))
+  (let ((challenge (unwrap! (map-get? community-challenges challenge-id) err-challenge-not-found))
+        (participant-key {challenge-id: challenge-id, user: tx-sender})
+        (participation (unwrap! (map-get? challenge-participants participant-key) err-not-found)))
+    (asserts! (get is-completed challenge) err-challenge-not-active)
+    (asserts! (not (get has-claimed-bonus participation)) err-bonus-already-claimed)
+
+    (let ((bonus-points (/ (* (get contribution-amount participation) (get bonus-percentage challenge)) u100)))
+      (try! (ft-mint? recycling-points bonus-points tx-sender))
+      (map-set challenge-participants participant-key {
+        contribution-amount: (get contribution-amount participation),
+        has-claimed-bonus: true
+      })
+      (ok bonus-points))))
+
+(define-read-only (get-challenge-info (challenge-id uint))
+  (map-get? community-challenges challenge-id))
+
+(define-read-only (get-user-challenge-participation (challenge-id uint) (user principal))
+  (map-get? challenge-participants {challenge-id: challenge-id, user: user}))
