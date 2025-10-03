@@ -315,3 +315,86 @@
 
 (define-read-only (get-user-challenge-participation (challenge-id uint) (user principal))
   (map-get? challenge-participants {challenge-id: challenge-id, user: user}))
+
+(define-map user-streaks principal {
+  current-streak: uint,
+  longest-streak: uint,
+  last-contribution-block: uint,
+  total-milestones-claimed: uint
+})
+
+(define-map streak-milestones uint {
+  required-streak: uint,
+  bonus-points: uint,
+  title: (string-ascii 40)
+})
+
+(define-data-var streak-interval-blocks uint u144)
+(define-data-var next-milestone-id uint u1)
+(define-constant err-streak-milestone-claimed (err u113))
+(define-constant err-streak-requirement-not-met (err u114))
+
+(define-public (initialize-streak-milestones)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set streak-milestones u1 {required-streak: u7, bonus-points: u50, title: "Week Warrior"})
+    (map-set streak-milestones u2 {required-streak: u30, bonus-points: u250, title: "Monthly Champion"})
+    (map-set streak-milestones u3 {required-streak: u90, bonus-points: u1000, title: "Quarter Legend"})
+    (map-set streak-milestones u4 {required-streak: u365, bonus-points: u5000, title: "Year Hero"})
+    (var-set next-milestone-id u5)
+    (ok true)))
+
+(define-private (update-user-streak (user principal))
+  (let ((streak-data (default-to {current-streak: u0, longest-streak: u0, last-contribution-block: u0, total-milestones-claimed: u0}
+                        (map-get? user-streaks user)))
+        (blocks-since-last (- stacks-block-height (get last-contribution-block streak-data)))
+        (interval (var-get streak-interval-blocks)))
+    (if (<= blocks-since-last interval)
+      (let ((new-streak (+ (get current-streak streak-data) u1)))
+        (map-set user-streaks user {
+          current-streak: new-streak,
+          longest-streak: (if (> new-streak (get longest-streak streak-data)) new-streak (get longest-streak streak-data)),
+          last-contribution-block: stacks-block-height,
+          total-milestones-claimed: (get total-milestones-claimed streak-data)
+        })
+        new-streak)
+      (begin
+        (map-set user-streaks user {
+          current-streak: u1,
+          longest-streak: (get longest-streak streak-data),
+          last-contribution-block: stacks-block-height,
+          total-milestones-claimed: (get total-milestones-claimed streak-data)
+        })
+        u1))))
+
+(define-public (contribute-and-update-streak (material-type-id uint) (quantity uint))
+  (begin
+    (try! (contribute-material material-type-id quantity))
+    (let ((new-streak (update-user-streak tx-sender)))
+      (ok {streak: new-streak}))))
+
+(define-public (claim-streak-milestone (milestone-id uint))
+  (let ((milestone (unwrap! (map-get? streak-milestones milestone-id) err-not-found))
+        (streak-data (unwrap! (map-get? user-streaks tx-sender) err-not-found)))
+    (asserts! (>= (get current-streak streak-data) (get required-streak milestone)) err-streak-requirement-not-met)
+    (asserts! (< (get total-milestones-claimed streak-data) milestone-id) err-streak-milestone-claimed)
+    (try! (ft-mint? recycling-points (get bonus-points milestone) tx-sender))
+    (map-set user-streaks tx-sender {
+      current-streak: (get current-streak streak-data),
+      longest-streak: (get longest-streak streak-data),
+      last-contribution-block: (get last-contribution-block streak-data),
+      total-milestones-claimed: milestone-id
+    })
+    (ok (get bonus-points milestone))))
+
+(define-read-only (get-user-streak (user principal))
+  (map-get? user-streaks user))
+
+(define-read-only (get-milestone-info (milestone-id uint))
+  (map-get? streak-milestones milestone-id))
+
+(define-public (set-streak-interval (new-interval uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set streak-interval-blocks new-interval)
+    (ok true)))
