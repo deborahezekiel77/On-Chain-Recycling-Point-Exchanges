@@ -398,3 +398,71 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (var-set streak-interval-blocks new-interval)
     (ok true)))
+
+
+(define-non-fungible-token carbon-certificate uint)
+(define-map carbon-rates uint uint)
+(define-map user-carbon-impact principal {total-kg-co2-saved: uint, certificates-earned: uint})
+(define-map certificate-metadata uint {holder: principal, level: (string-ascii 20), kg-co2: uint, issued-block: uint})
+(define-data-var next-certificate-id uint u1)
+(define-map achievement-tiers uint {level: (string-ascii 20), required-kg-co2: uint})
+(define-constant err-tier-not-reached (err u115))
+(define-constant err-certificate-exists (err u116))
+
+(define-public (initialize-carbon-system)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set carbon-rates u1 u82)
+    (map-set carbon-rates u2 u314)
+    (map-set carbon-rates u3 u166)
+    (map-set carbon-rates u4 u21)
+    (map-set achievement-tiers u1 {level: "Bronze Guardian", required-kg-co2: u100})
+    (map-set achievement-tiers u2 {level: "Silver Protector", required-kg-co2: u500})
+    (map-set achievement-tiers u3 {level: "Gold Champion", required-kg-co2: u2000})
+    (map-set achievement-tiers u4 {level: "Platinum Hero", required-kg-co2: u10000})
+    (ok true)))
+
+(define-public (contribute-and-track-carbon (material-type-id uint) (quantity uint))
+  (begin
+    (try! (contribute-material material-type-id quantity))
+    (let ((carbon-rate (default-to u0 (map-get? carbon-rates material-type-id)))
+          (kg-co2-saved (* quantity carbon-rate))
+          (current-impact (default-to {total-kg-co2-saved: u0, certificates-earned: u0}
+                            (map-get? user-carbon-impact tx-sender))))
+      (map-set user-carbon-impact tx-sender {
+        total-kg-co2-saved: (+ (get total-kg-co2-saved current-impact) kg-co2-saved),
+        certificates-earned: (get certificates-earned current-impact)
+      })
+      (ok {kg-co2-saved: kg-co2-saved, total-impact: (+ (get total-kg-co2-saved current-impact) kg-co2-saved)}))))
+
+(define-public (mint-certificate (tier-id uint))
+  (let ((tier (unwrap! (map-get? achievement-tiers tier-id) err-not-found))
+        (impact (unwrap! (map-get? user-carbon-impact tx-sender) err-not-found))
+        (cert-id (var-get next-certificate-id)))
+    (asserts! (>= (get total-kg-co2-saved impact) (get required-kg-co2 tier)) err-tier-not-reached)
+    (asserts! (< (get certificates-earned impact) tier-id) err-certificate-exists)
+    (try! (nft-mint? carbon-certificate cert-id tx-sender))
+    (map-set certificate-metadata cert-id {
+      holder: tx-sender,
+      level: (get level tier),
+      kg-co2: (get total-kg-co2-saved impact),
+      issued-block: stacks-block-height
+    })
+    (map-set user-carbon-impact tx-sender {
+      total-kg-co2-saved: (get total-kg-co2-saved impact),
+      certificates-earned: tier-id
+    })
+    (var-set next-certificate-id (+ cert-id u1))
+    (ok cert-id)))
+
+(define-read-only (get-user-carbon-impact (user principal))
+  (map-get? user-carbon-impact user))
+
+(define-read-only (get-certificate-data (cert-id uint))
+  (map-get? certificate-metadata cert-id))
+
+(define-read-only (get-tier-requirements (tier-id uint))
+  (map-get? achievement-tiers tier-id))
+
+(define-read-only (get-material-carbon-rate (material-id uint))
+  (map-get? carbon-rates material-id))
